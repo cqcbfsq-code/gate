@@ -42,17 +42,11 @@ jobs:
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
+          code=$(curl -s -o /dev/null -w '%{http_code}'             -H "Authorization: Bearer $GITHUB_TOKEN"             "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
           echo "Pages API status: $code"
           if [ "$code" = "404" ]; then
-            echo "首次运行: 启用 GitHub Pages (build_type = workflow, 目录 /public)"
-            curl -sS -X PUT \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
+            # workflow 型 Pages 只能 POST 创建，且不能同时带 source
+            curl -sS -X POST               -H "Authorization: Bearer $GITHUB_TOKEN"               -H "Content-Type: application/json"               -d '{"build_type":"workflow"}'               "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
             sleep 10
           fi
         env:
