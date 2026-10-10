@@ -1,0 +1,74 @@
+name: VPN Gate Node Check
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: gate-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Get VPN Gate nodes + check via Cloudflare + build page
+        run: python vpngate.py
+        env:
+          # 检测端点（Pages 版），放在 secret 里避免公开仓库把无鉴权探测接口广播出去
+          CHECK_WORKER: ${{ secrets.CHECK_WORKER }}
+          CHECK_CONCURRENCY: "24"
+          CHECK_TIMEOUT: "90"
+          ONLY_RESIDENTIAL: "1"
+          PER_COUNTRY: "6"
+
+      - name: Ensure GitHub Pages is enabled (one-time auto setup)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
+          echo "Pages API status: $code"
+          if [ "$code" = "404" ]; then
+            echo "首次运行: 启用 GitHub Pages (build_type = workflow, 目录 /public)"
+            curl -sS -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
+            sleep 10
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Show site URL
+        run: 'echo "nodes: https://cqcbfsq-code.github.io/gate/nodes.txt (deploy: ${{ steps.deployment.outcome }})"'
