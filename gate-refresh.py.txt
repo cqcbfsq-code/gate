@@ -126,11 +126,57 @@ def delay(name, token):
     u = (f"http://127.0.0.1:{CTRL_PORT}/proxies/{q}/delay"
          f"?url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout={DELAY_TIMEOUT}")
     try:
-        body = json.loads(http(u, headers={"Authorization": "Bearer " + CTRL_SECRET},
-                               timeout=DELAY_TIMEOUT / 1000 + 10).decode())
-        return int(body.get("delay", -1))
-    except Exception:
-        return -1
+        with urllib.request.urlopen(urllib.request.Request(
+                u, headers={"Authorization": "Bearer " + CTRL_SECRET}),
+                timeout=DELAY_TIMEOUT / 1000 + 10) as f:
+            return int(json.load(f).get("delay", -1))
+    except urllib.error.HTTPError:
+        return -1          # 503/504：mihomo 拨号失败，是节点真的不通
+    except OSError:
+        # 连不上控制器说明内核没起来，继续测下去只会得到一屏假死节点
+        raise SystemExit("[FATAL] 控制器无响应，内核未启动或端口被残留进程占用")
+
+
+def wait_core(timeout_s=30):
+    """轮询 /version 确认控制器真的在听。别拿日志字符串判断——log-level 会把它吞掉。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{CTRL_PORT}/version",
+                    headers={"Authorization": "Bearer " + CTRL_SECRET}), timeout=4) as f:
+                json.load(f)
+            return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
+def entry_pool():
+    """实测入口池（按延迟升序）。文件由 entry-bench.py 产出；没有就退回 nodes.txt 用过的入口。"""
+    p = os.path.join(TMP, "entry-bench.json")
+    pool = []
+    if os.path.exists(p):
+        for entry, hits, per in json.loads(io.open(p, encoding="utf-8").read()):
+            if hits >= 2 and per and all(per) and max(per) <= 500:
+                pool.append(entry)
+    return pool
+
+
+def rehome(lines):
+    """活下来的中继统一挂到实测最快的入口上：入口只是 CF 前门，与中继解耦，
+    按延迟顺序轮转分配，最快节点拿最快门。"""
+    pool = entry_pool()
+    if not pool:
+        return lines
+    out = []
+    for i, line in enumerate(lines):
+        _, sep, rest = line.partition("#")          # rest = "备注$链式目标"
+        if not sep:
+            out.append(line)
+            continue
+        out.append("%s#%s" % (pool[i % len(pool)], rest))
+    return out
 
 
 def main():
@@ -184,7 +230,10 @@ def main():
         yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
     subprocess.run([MH, "-d", RUN_DIR, "-t"], capture_output=True, check=True)
     core = subprocess.Popen([MH, "-d", RUN_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(5)
+    if not wait_core():
+        core.terminate()
+        raise SystemExit(f"[FATAL] {CTRL_PORT} 上的控制器起不来，先清掉残留内核进程再试")
+    print(f"[4.5] 拨测内核就绪（控制器 127.0.0.1:{CTRL_PORT}）")
 
     alive = {}
     try:
@@ -233,10 +282,15 @@ def main():
             final.append((alive[nodename],
                           f"{entry}#{country}-{i:02d}${tail.split('$', 1)[1]}"))
     final.sort(key=lambda x: x[0])
-    out = "\n".join(l for _, l in final) + "\n"
+    # 活下来的中继换到实测最快的入口上（最快节点配最快门），再落盘
+    lines2 = rehome([l for _, l in final])
+    pool = entry_pool()
+    order = sorted(final, key=lambda x: x[0])
+    out = "\n".join(lines2) + "\n"
     io.open(os.path.join(TMP, "ADD.alive.json"), "w", encoding="utf-8").write(
         json.dumps({"cand": cand, "alive": alive}, ensure_ascii=False, indent=1))
-    print(f"[7] 保留 {len(final)} 行（全活节点 {len(alive)} 个），最快 {final[0][0]}ms 最慢 {final[-1][0]}ms")
+    print(f"[7] 保留 {len(lines2)} 行（全活节点 {len(alive)} 个），最快 {order[0][0]}ms 最慢 {order[-1][0]}ms"
+          f"，入口换成实测前 {len(pool)} 名")
     if dry:
         print(out)
         return
