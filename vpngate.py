@@ -296,8 +296,7 @@ def build_outputs(results, raw_count, sstp_count, source):
 EDGE_HOSTS = [
     h.strip()
     for h in (os.environ.get("EDGE_HOSTS") or
-        "www.5199dy.com:443,ali.nonull.pp.ua:443,cdn.cnno.de:443,"
-        "auto.dolby.dpdns.org:443,saas.sin.fan:443,hzytjy.cn:443").split(",")
+        "ali.nonull.pp.ua:443,saas.sin.fan:443,104.19.1.1:443,104.18.7.34:443,104.17.2.7:443,104.16.98.7:443,104.17.44.9:443,104.19.191.31:443,104.17.201.77:443,104.16.66.7:443,104.16.88.7:443").split(",")
     if h.strip()
 ]
 

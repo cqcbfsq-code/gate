@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""家宽 ADD.txt 自动刷新（数据源 = 自家 cqcbfsq-code/gate 的 Pages 输出）。
+
+流程：拉 nodes.txt（带新鲜度闸门）→ 与 KV 现值去重合并 → 临时写入 KV →
+向面板取 /sub → 用本地 mihomo 逐节点串行 /delay 两轮 → 全活的节点重新编号写回 KV → 复核。
+任何一步没到 MIN_ALIVE 就回滚，绝不把线上列表写空。
+
+用法：python gate-refresh.py [--dry-run]
+"""
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+ACCT = "a66aec6aca5579a624dd80e90507609a"
+KV_NS = "3dc20741ea44443f92b92871aec099a9"  # 运行时按 ADD.txt 自动定位，这里只是默认值
+TMP = os.path.dirname(os.path.abspath(__file__))
+MH = os.path.join(TMP, "mhbin", "mihomo-windows-amd64.exe")
+NODES_URL = os.environ.get("NODES_URL", "https://cqcbfsq-code.github.io/gate/nodes.txt")
+DATA_URL = os.environ.get("DATA_URL", "https://cqcbfsq-code.github.io/gate/data.json")
+SUB_URL_FILE = os.path.join(TMP, "jiahuan-sub-url.txt")
+WRANGLER_TOML = os.path.expandvars(
+    r"C:\Users\Administrator\AppData\Roaming\xdg.config\.wrangler\config\default.toml")
+
+TEST_PORT = int(os.environ.get("TEST_PORT", "17899"))
+CTRL_PORT = int(os.environ.get("CTRL_PORT", "19099"))
+CTRL_SECRET = "refresh"
+ROUNDS = int(os.environ.get("ROUNDS", "2"))
+SPACING = float(os.environ.get("SPACING", "2"))
+DELAY_TIMEOUT = int(os.environ.get("DELAY_TIMEOUT", "6000"))
+MIN_ALIVE = int(os.environ.get("MIN_ALIVE", "5"))
+MAX_AGE_H = float(os.environ.get("MAX_AGE_H", "12"))
+RUN_DIR = os.path.join(TMP, "refresh-run")
+
+import yaml  # noqa: E402
+
+
+def http(url, data=None, headers=None, method=None, timeout=60):
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as f:
+        return f.read()
+
+
+def cf_token():
+    if os.environ.get("CF_TOKEN"):
+        return os.environ["CF_TOKEN"]
+    s = io.open(WRANGLER_TOML, encoding="utf-8", errors="ignore").read()
+    return re.search(r'oauth_token\s*=\s*"([^"]+)"', s).group(1)
+
+
+def kv_headers(token, ctype="application/json"):
+    return {"Authorization": "Bearer " + token, "Content-Type": ctype}
+
+
+def find_ns(token):
+    base = f"https://api.cloudflare.com/client/v4/accounts/{ACCT}/storage/kv"
+    try:
+        listing = json.loads(http(base + "/namespaces", headers=kv_headers(token)))["result"]
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise SystemExit("CF token 过期：先运行 `npx --yes wrangler whoami` 让它自动续期，再重跑本脚本")
+        raise
+    for n in listing:
+        keys = json.loads(http(f"{base}/namespaces/{n['id']}/keys", headers=kv_headers(token)))
+        if any(k["name"] == "ADD.txt" for k in keys.get("result", [])):
+            return n["id"]
+    raise SystemExit("找不到含 ADD.txt 的 KV 命名空间")
+
+
+def kv_read(token, ns):
+    base = f"https://api.cloudflare.com/client/v4/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/ADD.txt"
+    return http(base, headers=kv_headers(token)).decode("utf-8")
+
+
+def kv_write(token, ns, text):
+    base = f"https://api.cloudflare.com/client/v4/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/ADD.txt"
+    http(base, data=text.encode("utf-8"), headers=kv_headers(token, "text/plain"), method="PUT")
+
+
+def chain_lines(text):
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#") and "$" in ln and "://" in ln and "机房" not in ln:
+            out.append(ln)
+    return out
+
+
+def dedupe(lines):
+    seen, out = set(), []
+    for ln in lines:
+        t = ln.split("$", 1)[1]
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(ln)
+    return out
+
+
+def remark(line):
+    return re.search(r"#([^$]+)", line).group(1)
+
+
+def freshness_ok():
+    try:
+        from datetime import datetime, timezone
+        d = json.loads(http(DATA_URL, timeout=30).decode("utf-8"))
+        gen = d["generated_at"]
+        # data.json 的时间戳是 UTC，必须按 UTC 解析，否则本地时区会把年龄算错 8~16 小时
+        stamp = datetime.strptime(gen[:16], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - stamp).total_seconds() / 3600.0
+        print(f"[0] 数据源生成于 {gen} UTC，约 {age:.1f} 小时前")
+        return age <= MAX_AGE_H
+    except Exception as e:
+        print(f"[0] 读 data.json 失败：{e} —— 视为不新鲜，拒绝覆盖")
+        return False
+
+
+def delay(name, token):
+    q = urllib.parse.quote(name, safe="")
+    u = (f"http://127.0.0.1:{CTRL_PORT}/proxies/{q}/delay"
+         f"?url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout={DELAY_TIMEOUT}")
+    try:
+        body = json.loads(http(u, headers={"Authorization": "Bearer " + CTRL_SECRET},
+                               timeout=DELAY_TIMEOUT / 1000 + 10).decode())
+        return int(body.get("delay", -1))
+    except Exception:
+        return -1
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    if not freshness_ok():
+        raise SystemExit(f"数据源超过 {MAX_AGE_H} 小时或未更新，本次不改动 KV")
+
+    token = cf_token()
+    ns = find_ns(token)
+    old = kv_read(token, ns)
+    old_lines = chain_lines(old)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(TMP, f"ADD.backup-{stamp}.txt")
+    io.open(backup, "w", encoding="utf-8", newline="\n").write(old)
+    print(f"[1] 备份 KV {len(old_lines)} 行 / {len(old)} 字节 -> {backup}")
+
+    fresh = chain_lines(http(NODES_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=40).decode("utf-8"))
+    cand = dedupe(fresh + old_lines)
+    print(f"[2] {NODES_URL} 取到 {len(fresh)} 行住宅链式；合并去重后 {len(cand)} 行候选")
+
+    kv_write(token, ns, "\n".join(cand) + "\n")
+    print("[3] 候选临时写入 KV（供面板生成拨测节点）")
+    time.sleep(5)
+
+    sub = http(io.open(SUB_URL_FILE, encoding="utf-8").read().strip(),
+               headers={"User-Agent": "ClashMetaForAndroid/2.11.28"}, timeout=90).decode("utf-8")
+    proxies = yaml.safe_load(sub).get("proxies") or []
+    names = [p["name"] for p in proxies]
+    print(f"[4] 面板 /sub 输出 {len(proxies)} 个节点")
+    if len(proxies) != len(cand):
+        print(f"    !! 与候选 {len(cand)} 不一致（重名会被内核改名），继续但请复核")
+
+    os.makedirs(RUN_DIR, exist_ok=True)
+    cfg = {
+        "mixed-port": TEST_PORT,
+        "external-controller": f"127.0.0.1:{CTRL_PORT}",
+        "secret": CTRL_SECRET,
+        "log-level": "error",
+        "mode": "rule",
+        "allow-lan": False,
+        "ipv6": False,
+        "unified-delay": True,
+        "tcp-concurrent": True,
+        "dns": {"enable": True, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
+                "default-nameserver": ["223.5.5.5"], "nameserver": ["223.5.5.5"]},
+        "proxies": proxies,
+        "proxy-groups": [{"name": "T", "type": "select", "proxies": ["DIRECT"] + names}],
+        "rules": ["MATCH,T"],
+    }
+    io.open(os.path.join(RUN_DIR, "config.yaml"), "w", encoding="utf-8", newline="\n").write(
+        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
+    subprocess.run([MH, "-d", RUN_DIR, "-t"], capture_output=True, check=True)
+    core = subprocess.Popen([MH, "-d", RUN_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(5)
+
+    alive = {}
+    try:
+        for r in range(ROUNDS):
+            for n in names:
+                ms = delay(n, token)
+                if r == 0:
+                    if ms > 0:
+                        alive[n] = ms
+                elif ms > 0:
+                    # 只保留两轮都活的节点；单轮抖活的直接丢弃，别让静点进订阅
+                    if n in alive:
+                        alive[n] = min(alive[n], ms)
+                    else:
+                        print(f"    第{r + 1}轮才活，判为抖动丢弃：{n}")
+                else:
+                    alive.pop(n, None)
+                time.sleep(SPACING)
+            print(f"[5] 第 {r + 1} 轮结束，累计全活 {len(alive)}")
+    finally:
+        core.terminate()
+
+    if not dry:
+        kv_write(token, ns, old)  # 先恢复原值，筛完再写，避免中途出错留下大杂烩
+        print("[6] 已临时恢复原值，准备写入筛选结果")
+
+    if len(alive) < MIN_ALIVE:
+        print(f"[7] 全活仅 {len(alive)} < {MIN_ALIVE}，保持原值不变（备份 {backup}）")
+        return
+
+    grouped = {}
+    # 按“候选行 ↔ /sub 输出顺序”做下标映射：备注名会重复，重名时内核会加 " 2" 后缀，
+    # 用名字匹配会把 A 中继的延迟记到 B 中继头上。
+    order = {n: i for i, n in enumerate(names)}
+    for i, line in enumerate(cand):
+        if i >= len(names):
+            break
+        if names[i] in alive:
+            country = re.split(r"-\d+$", remark(line))[0]
+            grouped.setdefault(country, []).append((names[i], line))
+    final = []
+    for country, items in grouped.items():
+        items.sort(key=lambda x: alive[x[0]])
+        for i, (nodename, line) in enumerate(items, 1):
+            entry, _, tail = line.partition("#")
+            final.append((alive[nodename],
+                          f"{entry}#{country}-{i:02d}${tail.split('$', 1)[1]}"))
+    final.sort(key=lambda x: x[0])
+    out = "\n".join(l for _, l in final) + "\n"
+    io.open(os.path.join(TMP, "ADD.alive.json"), "w", encoding="utf-8").write(
+        json.dumps({"cand": cand, "alive": alive}, ensure_ascii=False, indent=1))
+    print(f"[7] 保留 {len(final)} 行（全活节点 {len(alive)} 个），最快 {final[0][0]}ms 最慢 {final[-1][0]}ms")
+    if dry:
+        print(out)
+        return
+    kv_write(token, ns, out)
+    time.sleep(5)
+    back = kv_read(token, ns)
+    io.open(os.path.join(TMP, "ADD.final.txt"), "w", encoding="utf-8", newline="\n").write(out)
+    print(f"[8] 读回 {len(back.splitlines())} 行；节点名 {sorted(set(remark(l) for l in back.splitlines() if l.strip()))[:6]} ...")
+
+
+if __name__ == "__main__":
+    main()
